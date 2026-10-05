@@ -46,6 +46,26 @@ class DistributedBatchSampler(lance.sampler.Sampler):
     or with a single rank, the full dataset is read.
     """
 
+    def __init__(self, shard_ranks: bool = True):
+        self.shard_ranks = shard_ranks
+        # Rank and world size captured in the main process for DataLoader
+        # workers, which have no process group of their own.
+        self._dist = None
+
+    def __getstate__(self):
+        # PROTOTYPE: pickling happens in the rank's main process when the
+        # DataLoader starts its workers, so the process group is visible.
+        state = self.__dict__.copy()
+        state["_dist"] = self._get_dist()
+        return state
+
+    def _get_dist(self):
+        if self._dist is not None:
+            return self._dist
+        if self.shard_ranks and dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        return 0, 1
+
     def __call__(
         self,
         dataset: lance.LanceDataset,
@@ -80,36 +100,48 @@ class DistributedBatchSampler(lance.sampler.Sampler):
         ValueError
             If the dataset has fewer rows than one global batch.
         """
-        if not (dist.is_available() and dist.is_initialized()):
-            world_size = 1
-        else:
-            world_size = dist.get_world_size()
-        if world_size == 1:
+        # PROTOTYPE: shard over DDP ranks (training only) and DataLoader
+        # workers. Shard ``rank * n_workers + worker_id`` of
+        # ``world_size * n_workers``.
+        rank, world_size = self._get_dist()
+        worker = torch.utils.data.get_worker_info()
+        worker_id, n_workers = (
+            (0, 1) if worker is None else (worker.id, worker.num_workers)
+        )
+        shard = rank * n_workers + worker_id
+        n_shards = world_size * n_workers
+        if n_shards == 1:
             yield from lance.sampler.FullScanSampler()(
                 dataset, *args, batch_size=batch_size, filter=filter, **kwargs
             )
             return
 
-        rank = dist.get_rank()
-        n_rows = dataset.count_rows(filter)
-        n_rows_rank = n_rows // (world_size * batch_size) * batch_size
-        if n_rows_rank == 0:
-            raise ValueError(
-                f"{n_rows} spectra are too few to give each of {world_size} "
-                f"devices a batch of {batch_size} spectra"
-            )
         # Lance's ShardedBatchSampler warns whenever `with_row_id` is passed,
         # even if it is False.
         if not kwargs.get("with_row_id"):
             kwargs.pop("with_row_id", None)
-        batches = lance.sampler.ShardedBatchSampler(rank, world_size)(
+        batches = lance.sampler.ShardedBatchSampler(shard, n_shards)(
             dataset, *args, batch_size=batch_size, filter=filter, **kwargs
         )
+        if world_size == 1:
+            # Evaluation / single device: keep every row. The DataLoader
+            # fetches from the workers round-robin, which restores the
+            # original batch order.
+            yield from batches
+            return
+
+        n_rows = dataset.count_rows(filter)
+        n_rows_shard = n_rows // (n_shards * batch_size) * batch_size
+        if n_rows_shard == 0:
+            raise ValueError(
+                f"{n_rows} spectra are too few to give each of {n_shards} "
+                f"data loading shards a batch of {batch_size} spectra"
+            )
         for batch in batches:
-            if batch.num_rows >= n_rows_rank:
-                yield batch.slice(0, n_rows_rank)
+            if batch.num_rows >= n_rows_shard:
+                yield batch.slice(0, n_rows_shard)
                 return
-            n_rows_rank -= batch.num_rows
+            n_rows_shard -= batch.num_rows
             yield batch
 
 
@@ -422,10 +454,14 @@ class DeNovoDataModule(pl.LightningDataModule):
                 **params,
             )
 
-        if mode == "train":
-            # Shard before shuffling, so that each rank shuffles only its
-            # own part of the training data.
-            dataset.sampler = DistributedBatchSampler()
+        # PROTOTYPE: reopen the written Lance dataset without the parsing
+        # options, which cannot be pickled for spawned DataLoader workers.
+        dataset = Dataset.from_lance(dataset.path, **params)
+
+        # Shard before shuffling, so that each rank shuffles only its
+        # own part of the training data. Evaluation data is only sharded
+        # across DataLoader workers.
+        dataset.sampler = DistributedBatchSampler(shard_ranks=mode == "train")
 
         if shuffle:
             buffer_batches = max(
@@ -459,6 +495,9 @@ class DeNovoDataModule(pl.LightningDataModule):
             pin_memory=True,
             num_workers=self.n_workers,
             shuffle=shuffle,
+            # PROTOTYPE: Lance is not fork-safe; forked workers deadlock.
+            multiprocessing_context="spawn" if self.n_workers > 0 else None,
+            persistent_workers=self.n_workers > 0,
         )
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:

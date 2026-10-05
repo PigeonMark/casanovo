@@ -40,9 +40,8 @@ def n_workers() -> int:
     int
         The number of workers.
     """
-    # FIXME: remove multiprocessing Linux deadlock issue workaround when
-    # deadlock issue is resolved.
-    return 0
+    # PROTOTYPE: worker count from the environment.
+    return int(os.environ.get("CASANOVO_N_WORKERS", 0))
 
     # Windows or MacOS: no multiprocessing.
     if platform.system() in ["Windows", "Darwin"]:
